@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{Utc, Duration};
 use futures::future::join_all;
 use clap::Parser;
+use unicode_width::UnicodeWidthStr;
 
 // Subxt macro to generate types from metadata
 #[subxt::subxt(runtime_metadata_path = "metadata.scale")]
@@ -181,7 +182,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let is_my_target = my_targets_ref.contains(&addr.0);
 
             // Score = (1 - Commission) / Total Stake
-            // Using total_stake in CTC (div by 10^18) to keep the numbers manageable
             let total_stake_ctc = (total_stake / 1_000_000_000_000_000_000) as f64;
             let profitability_score = if total_stake_ctc > 0.0 {
                 (1.0 - (commission_percent as f64 / 100.0)) / total_stake_ctc * 1_000_000.0
@@ -209,12 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut validator_details = join_all(validator_futures).await;
 
-    // Filter by my nominations if requested
     if args.mine {
         validator_details.retain(|v| v.is_my_target);
     }
 
-    // Recommendation logic
     if args.recommend {
         println!("Applying recommendation filters: Excluding validators with payouts > 7 days ago or N/A.");
         validator_details.retain(|v| {
@@ -223,10 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => false,
             }
         });
-        // Sort by profitability score descending
         validator_details.sort_by(|a, b| b.profitability_score.partial_cmp(&a.profitability_score).unwrap_or(std::cmp::Ordering::Equal));
     } else {
-        // Default sort by total stake descending
         validator_details.sort_by(|a, b| b.total_stake.cmp(&a.total_stake));
     }
 
@@ -237,10 +233,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for v in validator_details {
         let prefix = if v.is_my_target { "*" } else { " " };
-        println!("{:<2}{:<48} | {:<22} | {:>3}% | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>8.2} | {:<12}", 
+        
+        let truncated_name = truncate_string_by_width(&v.name, 22);
+        let name_padding = 22_isize - truncated_name.width() as isize;
+        let padded_name = if name_padding > 0 {
+            format!("{}{}", truncated_name, " ".repeat(name_padding as usize))
+        } else {
+            truncated_name
+        };
+
+        println!("{:<2}{:<48} | {} | {:>3}% | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>8.2} | {:<12}", 
                  prefix, 
                  v.address.to_string(), 
-                 truncate_string(&v.name, 22), 
+                 padded_name, 
                  v.commission, 
                  format_number(v.total_stake / 1_000_000_000_000_000_000), 
                  format_number(v.own_stake / 1_000_000_000_000_000_000),
@@ -327,19 +332,29 @@ fn format_number(n: u128) -> String {
     result
 }
 
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.chars().count() > max_len {
-        let mut count = 0;
-        let mut result = String::new();
-        for c in s.chars() {
-            if count >= max_len - 3 {
-                break;
-            }
-            result.push(c);
-            count += 1;
-        }
-        result + "..."
-    } else {
-        s.to_string()
+fn truncate_string_by_width(s: &str, max_width: usize) -> String {
+    if s.width() <= max_width {
+        return s.to_string();
     }
+
+    let mut current_width = 0;
+    let mut result = String::new();
+    let target_width = max_width.saturating_sub(3);
+
+    for c in s.chars() {
+        let cw = c.to_string().width();
+        if current_width + cw > target_width {
+            break;
+        }
+        result.push(c);
+        current_width += cw;
+    }
+
+    // Add padding to reach target_width if needed before dots
+    let dots_padding = target_width.saturating_sub(current_width);
+    if dots_padding > 0 {
+        result.push_str(&" ".repeat(dots_padding));
+    }
+
+    result + "..."
 }
