@@ -1,0 +1,8 @@
+# Example accounts for Creditcoin Validator Info
+# Format: <Name/Alias> <Address>
+
+Stash1 5H8YrGkk1zgZAaLxAdTBazqEJyZxGbZYgV5mLPshqqRF8Rwj
+Stash2 5ES52Q7gs2xrVQTAxS3kkoEkKmF5XzTAgSZbU7xTXnXozzKQ
+Stash3 5EoDxxJ5ix4rBEhN3wBZTpAdKzRFSkmVgm5wbeAUD8c8NBGj
+Validator1 5FC1AhVnnKvVqDmgsCQvXbDXi6623nkCMc8EnWGz8jh2BeVH
+Validator2 5DAZXAa6CCtAX6b4a9m5LPREQQazYEP8EpSABARhGFkRwvFx
