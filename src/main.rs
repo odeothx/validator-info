@@ -28,6 +28,7 @@ struct ValidatorInfo {
     commission: u32,
     total_stake: u128,
     own_stake: u128,
+    my_stake: u128,
     nominator_count: u32,
     era_points: u32,
     last_payout_era: Option<u32>,
@@ -41,6 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load my accounts
     let my_accounts = load_my_accounts("my_accounts.txt").unwrap_or_default();
+    let my_account_ids: HashSet<[u8; 32]> = my_accounts.values()
+        .filter_map(|addr_str| addr_str.parse::<AccountId32>().ok().map(|a| a.0))
+        .collect();
+        
     println!("Loaded {} accounts from my_accounts.txt", my_accounts.len());
 
     // 2. Connect to Creditcoin
@@ -49,13 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Fetch nomination targets for my accounts
     let mut my_targets = HashSet::new();
-    for (_alias, addr_str) in &my_accounts {
-        if let Ok(addr) = addr_str.parse::<AccountId32>() {
-            let nom_query = creditcoin::storage().staking().nominators(&addr);
-            if let Some(noms) = api.storage().at_latest().await?.fetch(&nom_query).await? {
-                for target in noms.targets.0 {
-                    my_targets.insert(target.0);
-                }
+    for addr_bytes in &my_account_ids {
+        let addr = AccountId32(*addr_bytes);
+        let nom_query = creditcoin::storage().staking().nominators(&addr);
+        if let Some(noms) = api.storage().at_latest().await?.fetch(&nom_query).await? {
+            for target in noms.targets.0 {
+                my_targets.insert(target.0);
             }
         }
     }
@@ -84,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for validator_addr in active_validators {
         let api_ref = api.clone();
         let my_targets_ref = &my_targets;
+        let my_account_ids_ref = &my_account_ids;
         let points = points_map.get(&validator_addr.0).cloned().unwrap_or(0);
         
         validator_futures.push(async move {
@@ -103,10 +108,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let commission = prefs.unwrap_or(None).map(|p| p.commission.0).unwrap_or(0);
-            let (total_stake, own_stake, nominator_count) = match overview.unwrap_or(None) {
-                Some(ov) => (ov.total, ov.own, ov.nominator_count),
-                None => (0, 0, 0),
+            let (total_stake, own_stake, nominator_count, page_count) = match overview.unwrap_or(None) {
+                Some(ov) => (ov.total, ov.own, ov.nominator_count, ov.page_count),
+                None => (0, 0, 0, 0),
             };
+
+            // Query pages for my stake
+            let mut my_stake = 0;
+            if my_targets_ref.contains(&addr.0) {
+                for page in 0..page_count {
+                    let page_query = creditcoin::storage().staking().eras_stakers_paged(current_era, &addr, page);
+                    if let Ok(Some(exposure_page)) = api_ref.storage().at_latest().await.unwrap().fetch(&page_query).await {
+                        for individual in exposure_page.others {
+                            if my_account_ids_ref.contains(&individual.who.0) {
+                                my_stake += individual.value;
+                            }
+                        }
+                    }
+                }
+            }
 
             let controller_addr = bonded.unwrap_or(None).unwrap_or(addr.clone());
             let ledger_query = creditcoin::storage().staking().ledger(&controller_addr);
@@ -117,7 +137,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_payout_era = l.legacy_claimed_rewards.0.last().cloned();
             }
 
-            // If legacy is empty, check modern ClaimedRewards for the last few eras
             if last_payout_era.is_none() {
                 for era in ( (current_era.saturating_sub(15))..(current_era + 1) ).rev() {
                     let claimed_query = creditcoin::storage().staking().claimed_rewards(era, &addr);
@@ -136,7 +155,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((reg, _)) = identity.unwrap_or(None) {
                 name = parse_data(reg.info.display);
             } else {
-                // Check SuperOf
                 let super_query = creditcoin::storage().identity().super_of(&addr);
                 if let Some((parent_addr, data)) = api_ref.storage().at_latest().await.unwrap().fetch(&super_query).await.unwrap_or(None) {
                     let parent_identity_query = creditcoin::storage().identity().identity_of(&parent_addr);
@@ -156,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 commission: commission / 10_000_000,
                 total_stake,
                 own_stake,
+                my_stake,
                 nominator_count,
                 era_points: points,
                 last_payout_era,
@@ -167,29 +186,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut validator_details = join_all(validator_futures).await;
 
-    // Filter if requested
     if args.mine {
         validator_details.retain(|v| v.is_my_target);
     }
 
-    // Sort by total stake descending
     validator_details.sort_by(|a, b| b.total_stake.cmp(&a.total_stake));
 
     // 5. Print results
-    println!("\n{:<2}{:<48} | {:<22} | {:>4} | {:>14} | {:>14} | {:>5} | {:>6} | {:>5} | {:<12}", 
-             " ", "Validator Address", "Name", "Comm", "Total (CTC)", "Own (CTC)", "Noms", "Points", "Era", "Last Payout");
-    println!("{}", "-".repeat(168));
+    println!("\n{:<2}{:<48} | {:<22} | {:>4} | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>5} | {:<12}", 
+             " ", "Validator Address", "Name", "Comm", "Total (CTC)", "Own (CTC)", "My (CTC)", "Noms", "Points", "Era", "Last Payout");
+    println!("{}", "-".repeat(180));
 
     for v in validator_details {
         let prefix = if v.is_my_target { "*" } else { " " };
         let era_str = v.last_payout_era.map(|e| e.to_string()).unwrap_or_else(|| "-".to_string());
-        println!("{:<2}{:<48} | {:<22} | {:>3}% | {:>14} | {:>14} | {:>5} | {:>6} | {:>5} | {:<12}", 
+        println!("{:<2}{:<48} | {:<22} | {:>3}% | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>5} | {:<12}", 
                  prefix, 
                  v.address.to_string(), 
                  truncate_string(&v.name, 22), 
                  v.commission, 
                  format_number(v.total_stake / 1_000_000_000_000_000_000), 
                  format_number(v.own_stake / 1_000_000_000_000_000_000),
+                 format_number(v.my_stake / 1_000_000_000_000_000_000),
                  v.nominator_count, 
                  v.era_points, 
                  era_str,
@@ -275,7 +293,16 @@ fn format_number(n: u128) -> String {
 
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.chars().count() > max_len {
-        s.chars().take(max_len - 3).collect::<String>() + "..."
+        let mut count = 0;
+        let mut result = String::new();
+        for c in s.chars() {
+            if count >= max_len - 3 {
+                break;
+            }
+            result.push(c);
+            count += 1;
+        }
+        result + "..."
     } else {
         s.to_string()
     }
