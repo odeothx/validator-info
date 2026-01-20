@@ -19,6 +19,10 @@ struct Args {
     /// Show only validators that I am staking to (nominating)
     #[arg(short, long)]
     mine: bool,
+
+    /// Recommend the best validators based on reward profitability
+    #[arg(short, long)]
+    recommend: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +37,9 @@ struct ValidatorInfo {
     era_points: u32,
     last_payout_era: Option<u32>,
     last_payout_date: String,
+    last_payout_days_ago: Option<i64>,
     is_my_target: bool,
+    profitability_score: f64,
 }
 
 #[tokio::main]
@@ -107,7 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_ref.storage().at_latest().await.unwrap().fetch(&identity_query)
             );
 
-            let commission = prefs.unwrap_or(None).map(|p| p.commission.0).unwrap_or(0);
+            let commission_raw = prefs.unwrap_or(None).map(|p| p.commission.0).unwrap_or(0);
+            let commission_percent = commission_raw / 10_000_000;
+            
             let (total_stake, own_stake, nominator_count, page_count) = match overview.unwrap_or(None) {
                 Some(ov) => (ov.total, ov.own, ov.nominator_count, ov.page_count),
                 None => (0, 0, 0, 0),
@@ -149,7 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let last_payout_date = last_payout_era.map(|e| era_to_date(current_era, e)).unwrap_or_else(|| "N/A".to_string());
+            let (last_payout_date, last_payout_days_ago) = last_payout_era.map(|e| {
+                let diff = current_era as i64 - e as i64;
+                let payout_time = Utc::now() - Duration::days(diff);
+                (payout_time.format("%Y-%m-%d").to_string(), Some(diff))
+            }).unwrap_or_else(|| ("N/A".to_string(), None));
 
             let mut name = "N/A".to_string();
             if let Some((reg, _)) = identity.unwrap_or(None) {
@@ -168,10 +180,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let is_my_target = my_targets_ref.contains(&addr.0);
 
+            // Score = (1 - Commission) / Total Stake
+            // Using total_stake in CTC (div by 10^18) to keep the numbers manageable
+            let total_stake_ctc = (total_stake / 1_000_000_000_000_000_000) as f64;
+            let profitability_score = if total_stake_ctc > 0.0 {
+                (1.0 - (commission_percent as f64 / 100.0)) / total_stake_ctc * 1_000_000.0
+            } else {
+                0.0
+            };
+
             ValidatorInfo {
                 address: addr,
                 name,
-                commission: commission / 10_000_000,
+                commission: commission_percent,
                 total_stake,
                 own_stake,
                 my_stake,
@@ -179,28 +200,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 era_points: points,
                 last_payout_era,
                 last_payout_date,
+                last_payout_days_ago,
                 is_my_target,
+                profitability_score,
             }
         });
     }
 
     let mut validator_details = join_all(validator_futures).await;
 
+    // Filter by my nominations if requested
     if args.mine {
         validator_details.retain(|v| v.is_my_target);
     }
 
-    validator_details.sort_by(|a, b| b.total_stake.cmp(&a.total_stake));
+    // Recommendation logic
+    if args.recommend {
+        println!("Applying recommendation filters: Excluding validators with payouts > 7 days ago or N/A.");
+        validator_details.retain(|v| {
+            match v.last_payout_days_ago {
+                Some(days) => days <= 7,
+                None => false,
+            }
+        });
+        // Sort by profitability score descending
+        validator_details.sort_by(|a, b| b.profitability_score.partial_cmp(&a.profitability_score).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        // Default sort by total stake descending
+        validator_details.sort_by(|a, b| b.total_stake.cmp(&a.total_stake));
+    }
 
     // 5. Print results
-    println!("\n{:<2}{:<48} | {:<22} | {:>4} | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>5} | {:<12}", 
-             " ", "Validator Address", "Name", "Comm", "Total (CTC)", "Own (CTC)", "My (CTC)", "Noms", "Points", "Era", "Last Payout");
-    println!("{}", "-".repeat(180));
+    println!("\n{:<2}{:<48} | {:<22} | {:>4} | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>8} | {:<12}", 
+             " ", "Validator Address", "Name", "Comm", "Total (CTC)", "Own (CTC)", "My (CTC)", "Noms", "Points", "Score", "Last Payout");
+    println!("{}", "-".repeat(186));
 
     for v in validator_details {
         let prefix = if v.is_my_target { "*" } else { " " };
-        let era_str = v.last_payout_era.map(|e| e.to_string()).unwrap_or_else(|| "-".to_string());
-        println!("{:<2}{:<48} | {:<22} | {:>3}% | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>5} | {:<12}", 
+        println!("{:<2}{:<48} | {:<22} | {:>3}% | {:>14} | {:>14} | {:>12} | {:>5} | {:>6} | {:>8.2} | {:<12}", 
                  prefix, 
                  v.address.to_string(), 
                  truncate_string(&v.name, 22), 
@@ -210,8 +247,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  format_number(v.my_stake / 1_000_000_000_000_000_000),
                  v.nominator_count, 
                  v.era_points, 
-                 era_str,
+                 v.profitability_score,
                  v.last_payout_date);
+    }
+
+    if args.recommend {
+        println!("\n[TIP] Recommended validators are sorted by Reward Score.");
+        println!("      Formula: (1 - Comm%) / TotalStake. Lower total stake means higher individual share.");
     }
 
     Ok(())
@@ -230,12 +272,6 @@ fn load_my_accounts(path: &str) -> std::io::Result<HashMap<String, String>> {
         }
     }
     Ok(accounts)
-}
-
-fn era_to_date(current_era: u32, claimed_era: u32) -> String {
-    let diff = current_era as i64 - claimed_era as i64;
-    let payout_time = Utc::now() - Duration::days(diff);
-    payout_time.format("%Y-%m-%d").to_string()
 }
 
 fn parse_data(data: creditcoin::runtime_types::pallet_identity::types::Data) -> String {
