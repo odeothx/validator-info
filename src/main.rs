@@ -8,6 +8,8 @@ use futures::future::join_all;
 use clap::Parser;
 use unicode_width::UnicodeWidthStr;
 
+mod plan;
+
 // Subxt macro to generate types from metadata
 #[subxt::subxt(runtime_metadata_path = "metadata.scale")]
 pub mod creditcoin {}
@@ -34,6 +36,14 @@ struct Args {
     /// File containing my account addresses
     #[arg(short = 'a', long, default_value = "my_accounts.txt")]
     accounts: String,
+
+    /// Plan nominations so all my validators stay elected with maximum reward
+    #[arg(short, long)]
+    plan: bool,
+
+    /// Minimum safety margin (CTC a rival must gain to push one of my validators out) for --plan
+    #[arg(long, default_value_t = 300_000.0)]
+    plan_margin: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Connect to Creditcoin
     let api = OnlineClient::<PolkadotConfig>::from_url(&args.url).await?;
     println!("Connected to {}", args.url);
+
+    if args.plan {
+        return run_plan(&api, &my_accounts, args.plan_margin).await;
+    }
 
     // 3. Fetch nomination targets for my accounts
     let mut my_targets = HashSet::new();
@@ -393,6 +407,202 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("      Formula: (1 - Comm%) / TotalStake. Lower total stake means higher individual share.");
     }
 
+    Ok(())
+}
+
+const PLANCK_PER_CTC: f64 = 1e18;
+
+/// Fetch the election snapshot from chain, then search and print the best nomination plan.
+async fn run_plan(
+    api: &OnlineClient<PolkadotConfig>,
+    my_accounts: &HashMap<String, String>,
+    min_margin: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use creditcoin::runtime_types::pallet_staking::RewardDestination;
+    use plan::{Candidate, Planner, Rng, Snapshot, Voter, Wallet};
+
+    let storage = api.storage().at_latest().await?;
+    let account_from_key = |key: &[u8]| -> [u8; 32] { key[key.len() - 32..].try_into().unwrap() };
+
+    // Ledgers: stash -> active bond, controller -> stash
+    let mut active_of: HashMap<[u8; 32], f64> = HashMap::new();
+    let mut stash_of_controller: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    let mut iter = storage.iter(creditcoin::storage().staking().ledger_iter()).await?;
+    while let Some(kv) = iter.next().await {
+        let kv = kv?;
+        active_of.insert(kv.value.stash.0, kv.value.active as f64 / PLANCK_PER_CTC);
+        stash_of_controller.insert(account_from_key(&kv.key_bytes), kv.value.stash.0);
+    }
+    let controller_of: HashMap<[u8; 32], [u8; 32]> = stash_of_controller.iter().map(|(c, s)| (*s, *c)).collect();
+
+    let mut payee_of: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    let mut iter = storage.iter(creditcoin::storage().staking().payee_iter()).await?;
+    while let Some(kv) = iter.next().await {
+        let kv = kv?;
+        let stash = account_from_key(&kv.key_bytes);
+        let dest = match kv.value {
+            RewardDestination::Account(a) => a.0,
+            RewardDestination::Controller => *controller_of.get(&stash).unwrap_or(&stash),
+            _ => stash,
+        };
+        payee_of.insert(stash, dest);
+    }
+
+    let my_ids: HashMap<[u8; 32], String> = my_accounts.iter()
+        .filter_map(|(name, addr)| addr.parse::<AccountId32>().ok().map(|a| (a.0, name.clone())))
+        .collect();
+
+    // Validator candidates
+    let mut candidates = Vec::new();
+    let mut own = Vec::new();
+    let mut iter = storage.iter(creditcoin::storage().staking().validators_iter()).await?;
+    while let Some(kv) = iter.next().await {
+        let kv = kv?;
+        let id = account_from_key(&kv.key_bytes);
+        let is_mine = my_ids.contains_key(&id) || payee_of.get(&id).map_or(false, |p| my_ids.contains_key(p));
+        if is_mine {
+            own.push(candidates.len());
+        }
+        candidates.push(Candidate {
+            id,
+            name: String::new(),
+            self_bond: *active_of.get(&id).unwrap_or(&0.0),
+            commission: kv.value.commission.0 as f64 / 1e9,
+        });
+    }
+    if own.is_empty() {
+        println!("No validators found whose stash or reward payee is in the accounts file. Nothing to plan.");
+        return Ok(());
+    }
+    for &c in &own {
+        let addr = AccountId32(candidates[c].id);
+        let identity = storage.fetch(&creditcoin::storage().identity().identity_of(&addr)).await?;
+        let name = identity.map(|(reg, _)| parse_data(reg.info.display)).filter(|n| !n.is_empty() && n != "None");
+        candidates[c].name = name
+            .or_else(|| my_ids.get(&candidates[c].id).cloned())
+            .unwrap_or_else(|| addr.to_string()[..8].to_string());
+    }
+    own.sort_by(|&a, &b| candidates[a].name.cmp(&candidates[b].name));
+
+    // Nominators
+    let index_of: HashMap<[u8; 32], usize> = candidates.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+    let mut voters = Vec::new();
+    let mut wallets = Vec::new();
+    let mut iter = storage.iter(creditcoin::storage().staking().nominators_iter()).await?;
+    while let Some(kv) = iter.next().await {
+        let kv = kv?;
+        let id = account_from_key(&kv.key_bytes);
+        if let Some(name) = my_ids.get(&id) {
+            wallets.push(Wallet { name: name.clone(), voter_idx: voters.len() });
+        }
+        voters.push(Voter {
+            id,
+            stake: *active_of.get(&id).unwrap_or(&0.0),
+            targets: kv.value.targets.0.iter().filter_map(|t| index_of.get(&t.0).copied()).collect(),
+        });
+    }
+    if wallets.is_empty() {
+        println!("None of the accounts in the accounts file is a nominator. Nothing to plan.");
+        return Ok(());
+    }
+    wallets.sort_by(|a, b| voters[b.voter_idx].stake.partial_cmp(&voters[a.voter_idx].stake).unwrap());
+    if own.len() > 10 {
+        println!("Too many own validators ({}) to search all subsets; at most 10 are supported.", own.len());
+        return Ok(());
+    }
+
+    // Era reward and era length
+    let desired = storage.fetch_or_default(&creditcoin::storage().staking().validator_count()).await? as usize;
+    let active_era = storage.fetch(&creditcoin::storage().staking().active_era()).await?.map(|a| a.index).unwrap_or(0);
+    let mut era_reward = 0.0;
+    for era in (active_era.saturating_sub(5)..active_era).rev() {
+        if let Some(r) = storage.fetch(&creditcoin::storage().staking().eras_validator_reward(era)).await? {
+            era_reward = r as f64 / PLANCK_PER_CTC;
+            break;
+        }
+    }
+    let constants = api.constants();
+    let era_ms = constants.at(&creditcoin::constants().staking().sessions_per_era())? as f64
+        * constants.at(&creditcoin::constants().babe().epoch_duration())? as f64
+        * constants.at(&creditcoin::constants().babe().expected_block_time())? as f64;
+
+    let snap = Snapshot {
+        candidates,
+        voters,
+        desired,
+        reward_per_validator: era_reward / desired.max(1) as f64,
+        eras_per_year: 365.0 * 24.0 * 3600.0 * 1000.0 / era_ms,
+        own,
+        wallets,
+    };
+    let planner = Planner::new(&snap);
+    let my_stake = planner.my_total_stake();
+    let own_set: HashSet<usize> = snap.own.iter().copied().collect();
+
+    println!("\n=== Nomination Plan (active era {}, {} seats, {} candidates, {} nominators) ===", active_era, desired, snap.candidates.len(), snap.voters.len());
+    println!("Election model: sequential Phragmén (no balancing), reward ~{:.1} CTC per validator per era", snap.reward_per_validator);
+    println!("My validators : {}", snap.own.iter().map(|&c| snap.candidates[c].name.clone()).collect::<Vec<_>>().join(", "));
+    println!("My wallets    : {} (total {} CTC incl. validator self-bond)",
+             snap.wallets.iter().map(|w| w.name.clone()).collect::<Vec<_>>().join(", "),
+             format_number(my_stake as u128));
+
+    let current: Vec<Vec<usize>> = snap.wallets.iter().map(|w| snap.voters[w.voter_idx].targets.clone()).collect();
+    let current_masks: Vec<u32> = current.iter().map(|targets| {
+        snap.own.iter().enumerate().filter(|(_, c)| targets.contains(c)).fold(0, |m, (i, _)| m | 1 << i)
+    }).map(|m| if m == 0 { (1 << snap.own.len()) - 1 } else { m }).collect();
+
+    println!("\nSearching nomination sets (min margin {} CTC)...", format_number(min_margin as u128));
+    let mut rng = Rng::new(0x5eed);
+    let best_masks = planner.optimize(min_margin, &current_masks, 6, &mut rng);
+    let best: Vec<Vec<usize>> = best_masks.iter().map(|&m| planner.mask_targets(m)).collect();
+
+    let report = |label: &str, config: &[Vec<usize>], rng: &mut Rng| {
+        let ev = planner.evaluate(config);
+        let margin = planner.margin(config, 1_000_000.0);
+        let robust = planner.robustness(config, 500, rng);
+        let elected = snap.own.iter().filter(|c| ev.election.winners.contains(c)).count();
+        println!("\n[{}] my validators elected {}/{} | reward {:.1} CTC/era | APR {:.2}% | margin {} CTC | all elected in {:.1}% of 500 perturbed runs",
+                 label, elected, snap.own.len(), ev.income_per_era,
+                 ev.income_per_era * snap.eras_per_year / my_stake * 100.0,
+                 format_number(margin as u128), robust * 100.0);
+        for &c in &snap.own {
+            match ev.election.winners.iter().position(|&w| w == c) {
+                Some(pos) => println!("    {:<16} elected  (seat {:>2}/{})  backing {:>12} CTC",
+                                      snap.candidates[c].name, pos + 1, desired, format_number(ev.election.backing[c] as u128)),
+                None => println!("    {:<16} NOT ELECTED", snap.candidates[c].name),
+            }
+        }
+    };
+    report("Current", &current, &mut rng);
+    report("Recommended", &best, &mut rng);
+
+    // Wallet x validator table
+    let short = |s: &str| truncate_string_by_width(s, 10);
+    print!("\n{:<12} | {:>12} |", "Wallet", "Bonded CTC");
+    for &c in &snap.own {
+        print!(" {:^10} |", short(&snap.candidates[c].name));
+    }
+    println!(" Change");
+    println!("{}", "-".repeat(30 + 13 * snap.own.len() + 8));
+    for ((w, targets), cur) in snap.wallets.iter().zip(&best).zip(&current) {
+        let stake = snap.voters[w.voter_idx].stake;
+        print!("{:<12} | {:>12} |", w.name, format_number(stake as u128));
+        for &c in &snap.own {
+            print!(" {:^10} |", if targets.contains(&c) { "O" } else { "-" });
+        }
+        let cur_own: HashSet<usize> = cur.iter().copied().filter(|c| own_set.contains(c)).collect();
+        let unchanged = cur_own == targets.iter().copied().collect() && cur.len() == cur_own.len();
+        println!(" {}", if unchanged { "keep" } else { "UPDATE" });
+    }
+
+    println!("\nstaking.nominate targets:");
+    for (w, targets) in snap.wallets.iter().zip(&best) {
+        println!("  {} ({}):", w.name, AccountId32(snap.voters[w.voter_idx].id));
+        for &c in targets {
+            println!("    {}  {}", AccountId32(snap.candidates[c].id), snap.candidates[c].name);
+        }
+    }
+    println!("\n[NOTE] Model assumes equal era points per validator. Re-run after any large stake or nomination change.");
     Ok(())
 }
 

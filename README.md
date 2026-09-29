@@ -49,6 +49,18 @@ cargo run --release -- --unpaid
 cargo run --release -- --recommend
 ```
 
+**자체 벨리데이터 노미네이션 플랜 (NEW!):**
+```bash
+cargo run --release -- --plan
+cargo run --release -- --plan --plan-margin 400000   # 더 보수적인 안전 여유분
+```
+직접 운영하는 벨리데이터(stash 또는 보상 수령 주소가 계정 파일에 있는 노드)가 **모두 선출되면서 보상이 최대가 되도록** 지갑별 노미네이션 대상을 계산합니다.
+- 체인과 같은 방식(Sequential Phragmén, 밸런싱 없음)으로 다음 선거를 시뮬레이션합니다.
+- 지갑마다 자체 노드의 어떤 조합을 지정할지 탐색합니다. 모든 지갑이 같은 노드 전부를 지정하면 뒤쪽 노드가 경쟁 노드에 밀릴 수 있습니다.
+- **Margin**: 경쟁 노드 하나가 스테이크를 얼마나 더 받아야 내 노드가 하나 떨어지는지(CTC). `--plan-margin` 이상을 만족하는 구성 중 보상이 가장 큰 것을 추천합니다(기본값 300,000).
+- **Perturbed runs**: 다른 노미네이터들의 스테이크를 ±10% 흔들고, 5%는 이탈시키고, 5%는 무작위로 재지정한 500회 시뮬레이션 중 내 노드가 모두 선출된 비율입니다.
+- 결과로 지갑별 대상 표와 `staking.nominate`에 넣을 주소 목록을 출력합니다.
+
 **RPC 서버 및 지갑 정보 파일 변경:**
 ```bash
 cargo run --release -- --url "wss://rpc.creditcoin.network" --accounts "other_accounts.txt"
