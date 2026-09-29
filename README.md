@@ -17,7 +17,7 @@ Creditcoin 메인넷의 벨리데이터 정보를 실시간으로 조회하고, 
 - [Rust](https://www.rust-lang.org/tools/install)가 설치되어 있어야 합니다.
 
 ### 2. 계정 설정
-본인의 Creditcoin 계정(Stash 또는 Controller) 주소를 `my_accounts.txt` 파일에 작성해 주세요. (파일명은 반드시 `my_accounts.txt`여야 합니다.)
+본인의 Creditcoin 계정(Stash 또는 Controller) 주소를 `my_accounts.txt` 파일에 작성해 주세요. (기본 파일명은 `my_accounts.txt`이며, `--accounts` 옵션으로 변경 가능합니다.)
 
 **형식:** `<별칭> <주소>` (중간 공백)
 ```text
@@ -38,10 +38,23 @@ cargo run --release
 cargo run --release -- --mine
 ```
 
+**미지급 보상이 있는 벨리데이터 확인 (NEW!):**
+```bash
+cargo run --release -- --unpaid
+```
+내가 노미네이팅 중인 벨리데이터 중 아직 Payout이 되지 않은 Era가 있는 노드를 찾아줍니다.
+
 **최적의 보상 벨리데이터 추천 (강력 추천):**
 ```bash
 cargo run --release -- --recommend
 ```
+
+**RPC 서버 및 지갑 정보 파일 변경:**
+```bash
+cargo run --release -- --url "wss://rpc.creditcoin.network" --accounts "other_accounts.txt"
+```
+- `--url`, `-u`: 접속할 RPC 노드 URL을 지정합니다. (기본값: `wss://mainnet3.creditcoin.network`)
+- `--accounts`, `-a`: 지갑 정보가 담긴 텍스트 파일을 지정합니다. (기본값: `my_accounts.txt`)
 
 ## 컬럼 설명
 

@@ -12,8 +12,6 @@ use unicode_width::UnicodeWidthStr;
 #[subxt::subxt(runtime_metadata_path = "metadata.scale")]
 pub mod creditcoin {}
 
-const NODE_URL: &str = "wss://mainnet3.creditcoin.network";
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -24,6 +22,18 @@ struct Args {
     /// Recommend the best validators based on reward profitability
     #[arg(short, long)]
     recommend: bool,
+
+    /// Show validators with unclaimed payouts for my account
+    #[arg(short, long)]
+    unpaid: bool,
+
+    /// RPC Node URL to connect to
+    #[arg(short = 'u', long, default_value = "wss://mainnet3.creditcoin.network")]
+    url: String,
+
+    /// File containing my account addresses
+    #[arg(short = 'a', long, default_value = "my_accounts.txt")]
+    accounts: String,
 }
 
 #[derive(Debug, Clone)]
@@ -36,11 +46,11 @@ struct ValidatorInfo {
     my_stake: u128,
     nominator_count: u32,
     era_points: u32,
-    last_payout_era: Option<u32>,
     last_payout_date: String,
     last_payout_days_ago: Option<i64>,
     is_my_target: bool,
     profitability_score: f64,
+    unpaid_eras: Vec<u32>,
 }
 
 #[tokio::main]
@@ -48,16 +58,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // 1. Load my accounts
-    let my_accounts = load_my_accounts("my_accounts.txt").unwrap_or_default();
+    let my_accounts = load_my_accounts(&args.accounts).unwrap_or_default();
     let my_account_ids: HashSet<[u8; 32]> = my_accounts.values()
         .filter_map(|addr_str| addr_str.parse::<AccountId32>().ok().map(|a| a.0))
         .collect();
         
-    println!("Loaded {} accounts from my_accounts.txt", my_accounts.len());
+    println!("Loaded {} accounts from {}", my_accounts.len(), args.accounts);
 
     // 2. Connect to Creditcoin
-    let api = OnlineClient::<PolkadotConfig>::from_url(NODE_URL).await?;
-    println!("Connected to {}", NODE_URL);
+    let api = OnlineClient::<PolkadotConfig>::from_url(&args.url).await?;
+    println!("Connected to {}", args.url);
 
     // 3. Fetch nomination targets for my accounts
     let mut my_targets = HashSet::new();
@@ -76,14 +86,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_era_query = creditcoin::storage().staking().current_era();
     let current_era = api.storage().at_latest().await?.fetch(&current_era_query).await?.unwrap_or(0);
     
-    let reward_points_query = creditcoin::storage().staking().eras_reward_points(current_era);
+    let active_era_query = creditcoin::storage().staking().active_era();
+    let active_era_info = api.storage().at_latest().await?.fetch(&active_era_query).await?;
+    let active_era = active_era_info.map(|a| a.index).unwrap_or(current_era);
+    
+    // 5. Fetch reward points for the active era
+    let reward_points_query = creditcoin::storage().staking().eras_reward_points(active_era);
     let reward_points = api.storage().at_latest().await?.fetch(&reward_points_query).await?;
     
     let points_map: HashMap<[u8; 32], u32> = reward_points
         .map(|p| p.individual.into_iter().map(|(acc, pts)| (acc.0, pts)).collect())
         .unwrap_or_default();
 
-    println!("Current Era: {}", current_era);
+    // Find the claimable era range once, outside the loop
+    let mut claimable_start_era = active_era.saturating_sub(1);
+    let mut claimable_end_era = active_era.saturating_sub(1);
+    let mut found_any_rewards = false;
+
+    for search_era in (active_era.saturating_sub(10)..active_era).rev() {
+        let era_reward_query = creditcoin::storage().staking().eras_validator_reward(search_era);
+        if api.storage().at_latest().await?.fetch(&era_reward_query).await?.is_some() {
+            claimable_end_era = search_era;
+            found_any_rewards = true;
+            break;
+        }
+    }
+
+    if found_any_rewards {
+        for search_era in (claimable_end_era.saturating_sub(100)..claimable_end_era).rev() {
+            let era_reward_query = creditcoin::storage().staking().eras_validator_reward(search_era);
+            if api.storage().at_latest().await?.fetch(&era_reward_query).await?.is_some() {
+                claimable_start_era = search_era;
+            } else {
+                break;
+            }
+        }
+    }
 
     // Fetch active validators
     let validators_query = creditcoin::storage().session().validators();
@@ -97,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let my_targets_ref = &my_targets;
         let my_account_ids_ref = &my_account_ids;
         let points = points_map.get(&validator_addr.0).cloned().unwrap_or(0);
+        let era_range = if found_any_rewards { Some(claimable_start_era..=claimable_end_era) } else { None };
         
         validator_futures.push(async move {
             let addr = validator_addr.clone();
@@ -189,6 +228,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
 
+            // Calculate unpaid eras (only for my targets)
+            let mut unpaid_eras = Vec::new();
+            if is_my_target {
+                if let Some(range) = era_range {
+                    for era in range {
+                        // Verify rewards still exist for this era
+                        let era_reward_query = creditcoin::storage().staking().eras_validator_reward(era);
+                        let has_era_reward = api_ref.storage().at_latest().await.unwrap()
+                            .fetch(&era_reward_query).await.unwrap_or(None).is_some();
+                        
+                        if !has_era_reward {
+                            continue;
+                        }
+                        
+                        // Check if validator was in the active set for this era
+                        let era_overview_query = creditcoin::storage().staking().eras_stakers_overview(era, &addr);
+                        let overview = api_ref.storage().at_latest().await.unwrap()
+                            .fetch(&era_overview_query).await.unwrap_or(None);
+                        
+                        if let Some(ov) = overview {
+                            // Check if payout was claimed for all pages
+                            let claimed_query = creditcoin::storage().staking().claimed_rewards(era, &addr);
+                            let claimed_pages = api_ref.storage().at_latest().await.unwrap()
+                                .fetch(&claimed_query).await
+                                .unwrap_or(None)
+                                .unwrap_or_default();
+                            
+                            let total_pages = ov.page_count;
+                            let all_claimed = if total_pages == 0 {
+                                claimed_pages.contains(&0)
+                            } else {
+                                (0..total_pages).all(|page| claimed_pages.contains(&page))
+                            };
+                            
+                            if !all_claimed {
+                                unpaid_eras.push(era);
+                            }
+                        }
+                    }
+                }
+            }
+
             ValidatorInfo {
                 address: addr,
                 name,
@@ -198,11 +279,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 my_stake,
                 nominator_count,
                 era_points: points,
-                last_payout_era,
                 last_payout_date,
                 last_payout_days_ago,
                 is_my_target,
                 profitability_score,
+                unpaid_eras,
             }
         });
     }
@@ -211,6 +292,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.mine {
         validator_details.retain(|v| v.is_my_target);
+    }
+
+    // Handle --unpaid option
+    if args.unpaid {
+        println!("\n🔍 Checking for unclaimed payouts for your nominated validators...\n");
+        
+        // Filter to show only my targets with unpaid eras
+        validator_details.retain(|v| v.is_my_target && !v.unpaid_eras.is_empty());
+        
+        if validator_details.is_empty() {
+            println!("✅ Good news! All payouts have been claimed for your nominated validators.");
+            println!("   (Checked last 84 eras)");
+        } else {
+            // Sort by number of unpaid eras (most unpaid first)
+            validator_details.sort_by(|a, b| b.unpaid_eras.len().cmp(&a.unpaid_eras.len()));
+            
+            println!("{:<48} | {:<22} | {:>10} | Unpaid Eras", 
+                     "Validator Address", "Name", "Unpaid");
+            println!("{}", "-".repeat(120));
+            
+            for v in &validator_details {
+                let truncated_name = truncate_string_by_width(&v.name, 22);
+                let name_padding = 22_isize - truncated_name.width() as isize;
+                let padded_name = if name_padding > 0 {
+                    format!("{}{}", truncated_name, " ".repeat(name_padding as usize))
+                } else {
+                    truncated_name
+                };
+                
+                // Format unpaid eras (show first few and count)
+                let unpaid_display = if v.unpaid_eras.len() <= 5 {
+                    v.unpaid_eras.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ")
+                } else {
+                    let first_five: Vec<_> = v.unpaid_eras.iter().take(5).map(|e| e.to_string()).collect();
+                    format!("{}, ... (+{} more)", first_five.join(", "), v.unpaid_eras.len() - 5)
+                };
+                
+                println!("{:<48} | {} | {:>10} | {}", 
+                         v.address.to_string(), 
+                         padded_name, 
+                         v.unpaid_eras.len(),
+                         unpaid_display);
+            }
+            
+            println!("\n⚠️  Found {} validator(s) with unclaimed payouts!", validator_details.len());
+            println!("💡 TIP: You can claim these rewards using polkadot.js or creditcoin-cli:");
+            println!("   - Each era must be claimed separately");
+            println!("   - Anyone can trigger the payout, rewards go to all nominators");
+        }
+        
+        return Ok(());
     }
 
     if args.recommend {
@@ -271,9 +403,28 @@ fn load_my_accounts(path: &str) -> std::io::Result<HashMap<String, String>> {
 
     for line in reader.lines() {
         let line = line?;
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            accounts.insert(parts[0].to_string(), parts[1].to_string());
+        let trimmed = line.trim();
+        
+        // Skip empty lines and comments
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        
+        // Support both "name = address" and "name address" formats
+        if trimmed.contains('=') {
+            let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                let name = parts[0].trim().to_string();
+                let addr = parts[1].trim().to_string();
+                if !name.is_empty() && !addr.is_empty() {
+                    accounts.insert(name, addr);
+                }
+            }
+        } else {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                accounts.insert(parts[0].to_string(), parts[1].to_string());
+            }
         }
     }
     Ok(accounts)
