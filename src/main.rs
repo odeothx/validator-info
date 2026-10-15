@@ -218,13 +218,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }).unwrap_or_else(|| ("N/A".to_string(), None));
 
             let mut name = "N/A".to_string();
-            if let Some((reg, _)) = identity.unwrap_or(None) {
+            if let Some(reg) = identity.unwrap_or(None) {
                 name = parse_data(reg.info.display);
             } else {
                 let super_query = creditcoin::storage().identity().super_of(&addr);
                 if let Some((parent_addr, data)) = api_ref.storage().at_latest().await.unwrap().fetch(&super_query).await.unwrap_or(None) {
                     let parent_identity_query = creditcoin::storage().identity().identity_of(&parent_addr);
-                    if let Some((parent_reg, _)) = api_ref.storage().at_latest().await.unwrap().fetch(&parent_identity_query).await.unwrap_or(None) {
+                    if let Some(parent_reg) = api_ref.storage().at_latest().await.unwrap().fetch(&parent_identity_query).await.unwrap_or(None) {
                         let parent_name = parse_data(parent_reg.info.display);
                         let sub_name = parse_data(data);
                         name = format!("{}/{}", parent_name, sub_name);
@@ -477,7 +477,7 @@ async fn run_plan(
     for &c in &own {
         let addr = AccountId32(candidates[c].id);
         let identity = storage.fetch(&creditcoin::storage().identity().identity_of(&addr)).await?;
-        let name = identity.map(|(reg, _)| parse_data(reg.info.display)).filter(|n| !n.is_empty() && n != "None");
+        let name = identity.map(|reg| parse_data(reg.info.display)).filter(|n| !n.is_empty() && n != "None");
         candidates[c].name = name
             .or_else(|| my_ids.get(&candidates[c].id).cloned())
             .unwrap_or_else(|| addr.to_string()[..8].to_string());
